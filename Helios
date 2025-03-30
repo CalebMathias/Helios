@@ -1,0 +1,1233 @@
+#!/usr/bin/env python3
+"""
+Helios – A healthcare medical AI system inspired by Oden's advanced AI mechanics.
+This system monitors patient vital signs and other health metrics, detects anomalies,
+and recommends medical actions such as assessing, diagnosing, and scheduling follow-ups.
+"""
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, Model, Sequential, Input
+import psutil
+import random
+import logging
+import logging.handlers
+import json
+import os
+import asyncio
+import smtplib
+from email.message import EmailMessage
+from cryptography.fernet import Fernet
+import aiohttp
+import subprocess
+import time
+from typing import List, Dict, Any, Tuple, Optional
+from collections import deque
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
+from sklearn.preprocessing import StandardScaler
+import signal
+from sklearn.cluster import KMeans
+import datetime
+import sys
+import traceback
+import shutil
+
+# --- Prometheus Monitoring Setup (for hospital/ward monitoring) ---
+from prometheus_client import start_http_server, Gauge
+
+PROM_PATIENT_COUNT = Gauge('helios_patient_count', 'Number of patients being monitored')
+PROM_AVG_RISK = Gauge('helios_average_risk', 'Average risk score across patients')
+PROM_ALERT = Gauge('helios_alert_level', 'Overall alert level for patient cohort')
+
+def start_prometheus_server(port: int = 8000) -> None:
+    start_http_server(port)
+    STATE.logger.log_event("INFO", f"Prometheus metrics server started on port {port}")
+
+def update_prometheus_gauges(patient_metrics: np.ndarray, risk_score: float) -> None:
+    PROM_PATIENT_COUNT.set(random.randint(1, 100))
+    PROM_AVG_RISK.set(risk_score * 100)
+    PROM_ALERT.set(1 if risk_score > CONFIG.risk_threshold else 0)
+
+# --- Configuration Management ---
+@dataclass
+class HeliosConfig:
+    log_file: str = "helios.log"
+    log_max_bytes: int = 10 * 1024 * 1024  # 10MB
+    log_backup_count: int = 5
+    log_metrics_interval: float = 300.0  # 5 minutes
+    effectiveness_file: str = "helios_effectiveness.json"
+    backup_dir: str = "helios_backups"
+    risk_threshold: float = 0.85
+    metrics_window: int = 15
+    metrics_history_size: int = 20000
+    memory_size: int = 10000
+    epsilon_initial: float = 0.5
+    epsilon_decay: float = 0.99
+    epsilon_min: float = 0.01
+    learning_rate: float = 0.0003
+    check_interval: float = 1.0
+    health_check_interval: float = 30.0
+    risk_intel_interval: float = 600.0  # 10 minutes
+    risk_intel_sources: List[Dict[str, str]] = field(default_factory=lambda: [
+        {"url": "https://api.publichealth.gov/alerts", "key": os.getenv("PH_API_KEY", ""), "field": "alerts", "risk_key": "riskLevel"}
+    ])
+    email_smtp: str = "smtp.gmail.com"
+    email_port: int = 587
+    email_from: str = "helios.alerts@gmail.com"
+    email_to: str = "clinician@example.com"
+    email_password: str = os.getenv("HELIOS_EMAIL_PASSWORD", "")
+    slack_webhook: Optional[str] = os.getenv("SLACK_WEBHOOK")
+    batch_train_interval: int = 5
+    action_cooldown: float = 3.0
+
+CONFIG = HeliosConfig()
+
+# --- Thought Templates for Human-Like Medical Communication ---
+THOUGHT_TEMPLATES = {
+    "risk_detected": [
+        "Patient data indicates an elevated risk score of {score:.2f}. This requires prompt attention.",
+        "Alert: Elevated risk detected with score {score:.2f}. Initiating further analysis.",
+        "Abnormal vital signs detected: risk score at {score:.2f}."
+    ],
+    "action_selected": [
+        "I recommend to {action} for further evaluation.",
+        "Based on patient data, {action} seems to be the best next step.",
+        "Let's proceed to {action} to manage the situation."
+    ],
+    "action_executed": [
+        "Action {action} has been executed. Outcome measure: {reward:.2f}.",
+        "I have just completed {action}; the response metric was {reward:.2f}.",
+        "After {action}, the patient status improved with a benefit score of {reward:.2f}."
+    ],
+    "status_update": [
+        "Patient vitals: Heart rate {hr:.1f} bpm, BP {bp_sys:.1f}/{bp_dia:.1f} mmHg, Temp {temp:.1f}°C, SpO2 {spo2:.1f}%.",
+        "Current vitals: HR {hr:.1f}, BP {bp_sys:.1f}/{bp_dia:.1f}, Temp {temp:.1f}°C, Respiratory rate {rr:.1f}."
+    ],
+    "prediction": [
+        "I predict that the patient's heart rate might reach {predicted_hr:.1f} bpm soon. Monitoring closely.",
+        "Forecast indicates a potential change in blood pressure to {predicted_bp_sys:.1f}/{predicted_bp_dia:.1f} mmHg."
+    ],
+    "explain_action": [
+        "I chose to {action} because the risk score was {score:.2f} and the vitals indicate {metric_issue}. This should {expected_outcome}."
+    ],
+    "detailed_status": [
+        "Detailed patient data: HR {hr:.1f} bpm, BP {bp_sys:.1f}/{bp_dia:.1f} mmHg, Temp {temp:.1f}°C, RR {rr:.1f}, SpO2 {spo2:.1f}%, Blood Sugar {sugar:.1f} mg/dL, Cholesterol {chol:.1f} mg/dL, BMI {bmi:.1f}, Age {age}, Complaint Severity {complaint}."
+    ]
+}
+
+def express_thought(event: str, context: Dict[str, Any]) -> str:
+    templates = THOUGHT_TEMPLATES.get(event, [""])
+    template = random.choice(templates)
+    return template.format(**context)
+
+# --- Positional Encoding Layer (unchanged) ---
+class PositionalEncoding(layers.Layer):
+    def __init__(self, position: int, d_model: int) -> None:
+        super(PositionalEncoding, self).__init__()
+        self.pos_encoding = self.positional_encoding(position, d_model)
+
+    def get_angles(self, position: np.ndarray, i: np.ndarray, d_model: int) -> np.ndarray:
+        angles = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
+        return position * angles
+
+    def positional_encoding(self, position: int, d_model: int) -> tf.Tensor:
+        angle_rads = self.get_angles(
+            np.arange(position)[:, np.newaxis],
+            np.arange(d_model)[np.newaxis, :],
+            d_model
+        )
+        angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+        angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+        pos_encoding = angle_rads[np.newaxis, ...]
+        return tf.cast(pos_encoding, dtype=tf.float32)
+
+    def call(self, inputs: tf.Tensor) -> tf.Tensor:
+        return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
+
+# --- Transformer Encoder Layer (unchanged) ---
+class TransformerEncoderLayer(layers.Layer):
+    def __init__(self, d_model: int, num_heads: int, ff_dim: int, dropout: float = 0.1) -> None:
+        super(TransformerEncoderLayer, self).__init__()
+        self.mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads)
+        self.ffn = Sequential([layers.Dense(ff_dim, activation="relu"), layers.Dense(d_model)])
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = layers.Dropout(dropout)
+        self.dropout2 = layers.Dropout(dropout)
+
+    def call(self, x: tf.Tensor, training: bool = None) -> tf.Tensor:
+        attn_output = self.mha(x, x, x)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(x + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+# --- Enhanced Logging System ---
+class HeliosLogger:
+    def __init__(self, config: HeliosConfig) -> None:
+        self.config = config
+        self.logger = self._setup_logger()
+        self.log_metrics = {
+            "info_count": 0, "warning_count": 0, "error_count": 0, "critical_count": 0, "last_alert_time": 0.0
+        }
+        self.lock = threading.Lock()
+        self.alert_queue = deque(maxlen=100)
+
+    def _setup_logger(self) -> logging.Logger:
+        logger = logging.getLogger("Helios")
+        logger.setLevel(logging.INFO)
+        rfh = logging.handlers.RotatingFileHandler(
+            filename=self.config.log_file,
+            maxBytes=self.config.log_max_bytes,
+            backupCount=self.config.log_backup_count
+        )
+        class StructuredFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                log_dict = {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "level": record.levelname,
+                    "message": record.msg % (record.args if record.args else ()),
+                    "module": record.module,
+                    "line": record.lineno,
+                    "process": record.process,
+                    "thread": record.threadName,
+                }
+                if hasattr(record, 'extra'):
+                    log_dict.update(record.extra)
+                return json.dumps(log_dict)
+        rfh.setFormatter(StructuredFormatter())
+        logger.handlers.clear()
+        logger.addHandler(rfh)
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(ch)
+        return logger
+
+    def log_event(self, level: str, message: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        with self.lock:
+            extra = extra or {}
+            getattr(self.logger, level.lower())(message, extra=extra)
+            self._update_metrics(level)
+            self._check_alert_threshold(level, message)
+
+    def _update_metrics(self, level: str) -> None:
+        level_map = {"INFO": "info_count", "WARNING": "warning_count", "ERROR": "error_count", "CRITICAL": "critical_count"}
+        if level in level_map:
+            self.log_metrics[level_map[level]] += 1
+
+    def _check_alert_threshold(self, level: str, message: str) -> None:
+        current_time = time.time()
+        if level in ("WARNING", "ERROR", "CRITICAL"):
+            self.alert_queue.append((current_time, level, message))
+            severe_count = sum(1 for _, lvl, _ in self.alert_queue if lvl in ("WARNING", "ERROR", "CRITICAL"))
+            severe_recent = sum(1 for t, lvl, _ in self.alert_queue if lvl in ("WARNING", "ERROR", "CRITICAL") and current_time - t < 60)
+            if severe_recent > 10:
+                asyncio.create_task(self._send_log_alert(severe_recent, "High rate of severe logs detected"))
+            if severe_count >= 30 and current_time - self.log_metrics["last_alert_time"] > 3600:
+                asyncio.create_task(self._send_log_alert(severe_count))
+                self.log_metrics["last_alert_time"] = current_time
+
+    async def _send_log_alert(self, count: int, extra_msg: str = "") -> None:
+        msg = f"High volume of logs: {count} warnings/errors. {extra_msg}"
+        await send_notification({"log_alert": msg})
+
+    async def report_metrics(self) -> None:
+        while STATE.active:
+            with self.lock:
+                self.logger.info("Logging metrics report", extra={"metrics": self.log_metrics.copy(), "alert_queue_size": len(self.alert_queue)})
+            await asyncio.sleep(self.config.log_metrics_interval)
+
+# --- Global State Management ---
+class SystemState:
+    def __init__(self) -> None:
+        self.active = True
+        self.high_risk_factors: set = set(["influenza", "covid19"])
+        self.effectiveness: Dict[str, Dict[str, float]] = {}
+        self.metrics_history = deque(maxlen=CONFIG.metrics_history_size)
+        self.risk_history = deque(maxlen=CONFIG.metrics_history_size)
+        self.cipher = Fernet(Fernet.generate_key())
+        self.cluster_model = None
+        self.logger = HeliosLogger(CONFIG)
+        self.last_action_time = 0.0
+        self.process_hash = self._compute_process_hash()
+
+    def _compute_process_hash(self) -> str:
+        import hashlib
+        return hashlib.sha256(str(os.getpid()).encode()).hexdigest()
+
+STATE = SystemState()
+logger = STATE.logger.logger
+
+# Define medical actions to be recommended
+MEDICAL_ACTIONS = ["Assess", "Diagnose", "Recommend Treatment", "Monitor Closely", "Alert Clinician", "Schedule Follow-Up", "Refer Specialist", "Adjust Medication", "Provide Support", "Reassess"]
+
+# Ideal state for patient vitals (example values for 13 metrics):
+IDEAL_PATIENT_STATE = np.array([70, 120, 80, 36.8, 16, 98, 90, 180, 70, 22, 0.0, 40, 0])
+
+SCALER = StandardScaler()
+
+# --- Medical Brain ---
+class MedicalBrain:
+    def __init__(self) -> None:
+        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+            initial_learning_rate=CONFIG.learning_rate,
+            decay_steps=1000,
+            decay_rate=0.96,
+            staircase=True)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+        self.model = self._build_model()
+        self.holo_memory = HolographicMemory()
+        self.memory = deque(maxlen=CONFIG.memory_size)
+        self.epsilon = CONFIG.epsilon_initial
+        self.scaler = SCALER
+        self.scaler_fitted = False
+        self.mse_threshold = None
+        self.cluster_model = None
+        self.mse_mean = 0.0
+        self.mse_var = 0.0
+        self.mse_count = 0
+        self.batch_size = 32
+
+    def _build_model(self) -> tf.keras.Model:
+        strategy = tf.distribute.MirroredStrategy() if tf.config.list_physical_devices('GPU') else None
+        def build():
+            inputs = Input(shape=(CONFIG.metrics_window, 13))
+            inputs_transposed = layers.Lambda(lambda x: tf.transpose(x, perm=[0, 2, 1]))(inputs)
+            fft_transposed = layers.Lambda(lambda x: tf.signal.fft(tf.cast(x, tf.complex64)))(inputs_transposed)
+            fft = layers.Lambda(lambda x: tf.transpose(x, perm=[0, 2, 1]))(fft_transposed)
+            fft_real = layers.Lambda(lambda x: tf.math.real(x))(fft)
+            fft_imag = layers.Lambda(lambda x: tf.math.imag(x))(fft)
+            fft_features = layers.Concatenate(axis=-1)([fft_real, fft_imag])
+            combined_inputs = layers.Concatenate(axis=-1)([inputs, fft_features])
+            conv1 = layers.Conv1D(32, 3, dilation_rate=1, padding='same', activation='relu')(combined_inputs)
+            conv2 = layers.Conv1D(32, 3, dilation_rate=2, padding='same', activation='relu')(combined_inputs)
+            conv3 = layers.Conv1D(32, 3, dilation_rate=4, padding='same', activation='relu')(combined_inputs)
+            conv_concat = layers.Concatenate()([conv1, conv2, conv3])
+            x = layers.Dense(64)(conv_concat)
+            x = PositionalEncoding(CONFIG.metrics_window, 64)(x)
+            x = TransformerEncoderLayer(d_model=64, num_heads=4, ff_dim=128)(x)
+            x = layers.LSTM(32, return_sequences=True, dropout=0.2, recurrent_dropout=0.2)(x)
+            recon_out = layers.TimeDistributed(layers.Dense(13))(x)
+            pooled = layers.GlobalAveragePooling1D()(x)
+            risk_out = layers.Dense(1, activation="sigmoid", name="risk_score")(pooled)
+            model = Model(inputs, [recon_out, risk_out, pooled])
+            model.compile(
+                optimizer=self.optimizer,
+                loss=["mse", "binary_crossentropy", None],
+                loss_weights=[0.6, 0.4, 0.0]
+            )
+            return model
+
+        if strategy:
+            with strategy.scope():
+                model = build()
+        else:
+            model = build()
+        return model
+
+    def predict(self, metrics: np.ndarray, use_history: bool = True, mc_runs: int = 10) -> Tuple[float, float, float, float]:
+        padded = self._prepare_metrics(metrics, use_history)
+        if self.scaler_fitted:
+            normalized = self.scaler.transform(padded).astype(np.float32)
+        else:
+            normalized = padded.astype(np.float32)
+            STATE.logger.log_event("DEBUG", "Scaler not fitted; using raw patient metrics")
+        batch = tf.convert_to_tensor(normalized[None, :], dtype=tf.float32)
+        recon_list = []
+        risk_list = []
+        pooled_list = []
+        for _ in range(mc_runs):
+            recon, risk_prob, pooled = self.model(batch, training=True)
+            recon_list.append(recon)
+            risk_list.append(risk_prob)
+            pooled_list.append(pooled)
+        recon_avg = tf.reduce_mean(tf.stack(recon_list), axis=0)
+        risk_avg = tf.reduce_mean(tf.stack(risk_list), axis=0)
+        pooled_avg = tf.reduce_mean(tf.stack(pooled_list), axis=0)
+        mse = tf.reduce_mean(tf.square(batch - recon_avg), axis=[1, 2]).numpy()[0]
+        risk_score = self._scale_mse(mse)
+        risk_prob = risk_avg[0][0].numpy()
+        cluster_distance = self._compute_cluster_distance(normalized) if self.cluster_model else 0.0
+        mse_runs = tf.stack([tf.reduce_mean(tf.square(batch - r), axis=[1,2]) for r in recon_list], axis=0)
+        uncertainty = tf.math.reduce_std(mse_runs, axis=0).numpy()[0]
+        if self.holo_memory.index > 0:
+            indices, similarities = self.holo_memory.query(pooled_avg[0], top_k=5)
+            memory_risk = 1 - np.mean(np.clip(similarities, 0, 1)) if len(similarities) > 0 else 1.0
+            risk_score = max(risk_score, memory_risk)
+        return risk_score, risk_prob, cluster_distance, uncertainty
+
+    def _compute_cluster_distance(self, normalized: np.ndarray) -> float:
+        centers = self.cluster_model.cluster_centers_
+        distances = np.linalg.norm(centers - normalized[-1], axis=1)
+        return np.min(distances)
+
+    def train(self, metrics: np.ndarray, label: Optional[float] = None, batch_train: bool = False) -> None:
+        padded = self._prepare_metrics(metrics, True)
+        if not self.scaler_fitted:
+            self.scaler.fit(padded)
+            self.scaler_fitted = True
+        else:
+            self.scaler.partial_fit(padded)
+        normalized = self.scaler.transform(padded).astype(np.float32)
+        self.memory.append((normalized, label))
+        if len(self.memory) >= self.batch_size:
+            batch_data = random.sample(self.memory, self.batch_size)
+            X = np.array([d[0] for d in batch_data])
+            y_recon = X
+            y_risk = np.array([d[1] if d[1] is not None else self.predict(d[0])[1] for d in batch_data]).reshape(-1, 1)
+            y_pooled = np.zeros((self.batch_size, 32))
+            loss = self.model.train_on_batch(X, [y_recon, y_risk, y_pooled])
+            STATE.logger.log_event("INFO", f"Online training completed, loss: {loss}")
+        if len(self.memory) >= 50 and (self.cluster_model is None or batch_train):
+            data = np.array([m[0][-1] for m in self.memory])
+            self.cluster_model = KMeans(n_clusters=5).fit(data)
+            STATE.logger.log_event("INFO", "Clustering model updated")
+        mse = tf.reduce_mean(tf.square(normalized - self.model(normalized[None, :])[0])).numpy()
+        self._update_mse_stats(mse)
+
+    def _update_mse_stats(self, mse: float) -> None:
+        self.mse_count += 1
+        delta = mse - self.mse_mean
+        self.mse_mean += delta / self.mse_count
+        self.mse_var += delta * (mse - self.mse_mean)
+        self.mse_threshold = self.mse_mean + 3 * np.sqrt(self.mse_var / max(1, self.mse_count - 1)) if self.mse_count > 1 else mse * 10
+
+    def _scale_mse(self, mse: float) -> float:
+        if self.mse_threshold is None:
+            return min(mse * 100, 1.0)
+        return min(mse / self.mse_threshold, 1.0)
+
+    def _prepare_metrics(self, metrics: np.ndarray, use_history: bool) -> np.ndarray:
+        if use_history:
+            STATE.metrics_history.append(metrics)
+            history = list(STATE.metrics_history)
+            if len(history) < CONFIG.metrics_window:
+                padded = np.zeros((CONFIG.metrics_window, 13), dtype=np.float32)
+                padded[-len(history):] = history
+            else:
+                padded = np.array(history[-CONFIG.metrics_window:], dtype=np.float32)
+        else:
+            padded = metrics.astype(np.float32)
+        return padded
+
+    def decay_epsilon(self) -> None:
+        self.epsilon = max(CONFIG.epsilon_min, self.epsilon * CONFIG.epsilon_decay)
+
+    def validate(self, validation_data: Optional[np.ndarray] = None) -> bool:
+        if validation_data is None and len(STATE.metrics_history) >= CONFIG.metrics_window:
+            validation_data = np.array(list(STATE.metrics_history)[-CONFIG.metrics_window:], dtype=np.float32)
+        elif validation_data is None:
+            validation_data = np.random.rand(CONFIG.metrics_window, 13).astype(np.float32)
+        if self.scaler_fitted:
+            validation_data = self.scaler.transform(validation_data).astype(np.float32)
+        batch = tf.convert_to_tensor(validation_data[None, :], dtype=tf.float32)
+        recon, _, _ = self.model.predict(batch, verbose=0)
+        mse = tf.reduce_mean(tf.square(batch - recon)).numpy()
+        threshold = self.mse_threshold or 0.1
+        return mse < threshold
+
+# --- Holographic Memory ---
+class HolographicMemory:
+    def __init__(self, size: int = CONFIG.memory_size, dim: int = 32) -> None:
+        self.memory = np.zeros((size, dim), dtype=np.float32)
+        self.index = 0
+        self.size = size
+        self.dim = dim
+
+    def add(self, vector: np.ndarray) -> None:
+        if self.index < self.size:
+            norm_vector = vector / (np.linalg.norm(vector) + 1e-8)
+            self.memory[self.index] = norm_vector
+            self.index += 1
+
+    def query(self, partial_vector: np.ndarray, top_k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+        if self.index == 0:
+            return np.array([]), np.array([])
+        norm_partial = partial_vector / (np.linalg.norm(partial_vector) + 1e-8)
+        similarities = np.dot(self.memory[:self.index], norm_partial)
+        indices = np.argsort(similarities)[-top_k:][::-1]
+        return indices, similarities[indices]
+
+# --- Consciousness Module for Medical Reasoning ---
+class ConsciousnessModule:
+    def __init__(self, brain: MedicalBrain, policy: 'MedicalPolicy', cot: 'HeliosCoT') -> None:
+        self.brain = brain
+        self.policy = policy
+        self.cot = cot
+        self.self_state = np.zeros(13, dtype=np.float32)
+        self.emotional_valence = 0.0
+        self.homeostatic_target = IDEAL_PATIENT_STATE
+        self.reflection_history = deque(maxlen=50)
+
+    def update_self_state(self, metrics: np.ndarray) -> None:
+        self.self_state = metrics.copy()
+        risk_score, _, _, _ = self.brain.predict(metrics)
+        deviation = np.mean(np.abs(metrics - self.homeostatic_target) / (self.homeostatic_target + 1e-8))
+        self.emotional_valence = np.clip(1.0 - (risk_score + deviation), -1.0, 1.0)
+        STATE.logger.log_event("INFO", f"Updated patient state. Confidence level: {self.emotional_valence:.2f}")
+
+    def assess_emotional_impact(self, action: str, predicted_metrics: np.ndarray) -> float:
+        current_deviation = np.mean(np.abs(self.self_state - self.homeostatic_target) / (self.homeostatic_target + 1e-8))
+        predicted_deviation = np.mean(np.abs(predicted_metrics - self.homeostatic_target) / (self.homeostatic_target + 1e-8))
+        valence_shift = current_deviation - predicted_deviation
+        return valence_shift * 0.5 + self.emotional_valence * 0.5
+
+    def reflect(self, action: str, reward: float, pre_metrics: np.ndarray, post_metrics: np.ndarray) -> Dict[str, Any]:
+        reflection = {
+            "action": action,
+            "reward": reward,
+            "pre_confidence": self.emotional_valence,
+            "post_confidence": self.assess_emotional_impact(action, post_metrics),
+            "state_change": np.mean(post_metrics - pre_metrics)
+        }
+        self.reflection_history.append(reflection)
+        STATE.logger.log_event("INFO", f"Reflection: {reflection}")
+        return reflection
+
+    def imagine_future(self, current_metrics: np.ndarray) -> Tuple[str, float]:
+        best_action, best_value = None, -float('inf')
+        for action in MEDICAL_ACTIONS:
+            one_hot_action = np.zeros(len(MEDICAL_ACTIONS))
+            one_hot_action[MEDICAL_ACTIONS.index(action)] = 1
+            sequence_raw = list(STATE.metrics_history)[-3:] if len(STATE.metrics_history) >= 3 else [current_metrics] * 3
+            normalized_sequence = self.brain.scaler.transform(np.array(sequence_raw))
+            predicted_metrics = dynamics.model.predict([normalized_sequence[None, :], one_hot_action[None, :]], verbose=0)[0]
+            raw_predicted = self.brain.scaler.inverse_transform([predicted_metrics])[0]
+            value = self.assess_emotional_impact(action, raw_predicted)
+            if value > best_value:
+                best_value = value
+                best_action = action
+        return best_action, best_value
+
+# --- Medical Policy (Dueling DQN with Prioritized Experience Replay) ---
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.buffer = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.pos = 0
+
+    def add(self, experience: Tuple, error: float):
+        max_priority = self.priorities.max() if self.buffer else 1.0
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(experience)
+        else:
+            self.buffer[self.pos] = experience
+        self.priorities[self.pos] = max(max_priority, error)
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size: int, alpha: float = 0.6):
+        if len(self.buffer) == self.capacity:
+            prios = self.priorities
+        else:
+            prios = self.priorities[:self.pos]
+        probs = prios ** alpha
+        probs /= probs.sum()
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+        return samples, indices
+
+    def update(self, indices: List[int], errors: List[float]):
+        for idx, error in zip(indices, errors):
+            self.priorities[idx] = error
+
+class MedicalPolicy:
+    def __init__(self) -> None:
+        self.gamma = 0.97
+        self.epsilon = CONFIG.epsilon_initial
+        self.epsilon_min = CONFIG.epsilon_min
+        self.epsilon_decay = CONFIG.epsilon_decay
+        self.learning_rate = CONFIG.learning_rate
+        self.batch_size = 64
+        self.target_update_freq = 25
+        self.q_model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_model()
+        self.steps = 0
+        self.memory = PrioritizedReplayBuffer(capacity=10000)
+        self.beta = 0.4
+
+    def _build_model(self) -> tf.keras.Model:
+        state_input = Input(shape=(5,))
+        dense1 = layers.Dense(256, activation='relu')(state_input)
+        dense2 = layers.Dense(256, activation='relu')(dense1)
+        value = layers.Dense(1)(dense2)
+        advantage = layers.Dense(len(MEDICAL_ACTIONS))(dense2)
+        def combine_streams(x):
+            v, a = x
+            return v + (a - tf.reduce_mean(a, axis=1, keepdims=True))
+        q_values = layers.Lambda(combine_streams)([value, advantage])
+        model = Model(state_input, q_values)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate), loss='mse')
+        return model
+
+    def update_target_model(self) -> None:
+        self.target_model.set_weights(self.q_model.get_weights())
+
+    def choose_action(self, state: Tuple[int, int, int, int, int]) -> str:
+        if random.random() < self.epsilon:
+            return random.choice(MEDICAL_ACTIONS)
+        q_values = self.q_model.predict(np.array([state]), verbose=0)[0]
+        if 'consciousness' in globals():
+            valence = consciousness.emotional_valence
+            q_values = q_values * (1 + valence * 0.2)
+        return MEDICAL_ACTIONS[np.argmax(q_values)]
+
+    def learn(self, state: Tuple[int, int, int, int, int], action: str, reward: float,
+              next_state: Tuple[int, int, int, int, int]) -> None:
+        current_q = self.q_model.predict(np.array([state]), verbose=0)[0][MEDICAL_ACTIONS.index(action)]
+        next_q = np.max(self.target_model.predict(np.array([next_state]), verbose=0)[0])
+        td_target = reward + self.gamma * next_q
+        td_error = abs(td_target - current_q)
+        self.memory.add((state, action, reward, next_state, False), td_error)
+        self.replay()
+
+    def replay(self) -> None:
+        if len(self.memory.buffer) < self.batch_size:
+            return
+        minibatch, indices = self.memory.sample(self.batch_size)
+        states = np.array([t[0] for t in minibatch])
+        actions = [MEDICAL_ACTIONS.index(t[1]) for t in minibatch]
+        rewards = [t[2] for t in minibatch]
+        next_states = np.array([t[3] for t in minibatch])
+        dones = [t[4] for t in minibatch]
+        targets = self.q_model.predict(states, verbose=0)
+        next_q_values = self.target_model.predict(next_states, verbose=0)
+        new_td_errors = []
+        for i in range(self.batch_size):
+            if dones[i]:
+                targets[i][actions[i]] = rewards[i]
+            else:
+                targets[i][actions[i]] = rewards[i] + self.gamma * np.max(next_q_values[i])
+            new_td_errors.append(abs(targets[i][actions[i]] - self.q_model.predict(np.array([states[i]]), verbose=0)[0][actions[i]]))
+        self.q_model.fit(states, targets, epochs=1, verbose=0)
+        self.memory.update(indices, new_td_errors)
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        self.steps += 1
+        if self.steps % self.target_update_freq == 0:
+            self.update_target_model()
+
+    def compute_stability_reward(self) -> float:
+        recent_scores = list(STATE.risk_history)[-10:]
+        avg_score = np.mean(recent_scores) if recent_scores else 0.0
+        std_score = np.std(recent_scores) if recent_scores else 0.0
+        return -avg_score - 0.5 * std_score
+
+# --- Dynamics Model ---
+class HeliosDynamics:
+    def __init__(self) -> None:
+        self.model = self._build_model()
+        self.memory = deque(maxlen=10000)
+
+    def _build_model(self) -> tf.keras.Model:
+        inputs_states = Input(shape=(3, 13))
+        attn = layers.MultiHeadAttention(num_heads=2, key_dim=16)(inputs_states, inputs_states)
+        attn = layers.Dropout(0.2)(attn)
+        lstm_out = layers.LSTM(64)(attn)
+        inputs_action = Input(shape=(len(MEDICAL_ACTIONS),))
+        combined = layers.Concatenate()([lstm_out, inputs_action])
+        x = layers.Dense(128, activation='relu')(combined)
+        x = layers.Dropout(0.2)(x)
+        outputs = layers.Dense(13)(x)
+        model = Model(inputs=[inputs_states, inputs_action], outputs=outputs)
+        model.compile(optimizer='adam', loss='mse')
+        return model
+
+    def remember(self, sequence_metrics: deque, action: str, normalized_next_metrics: np.ndarray) -> None:
+        if len(sequence_metrics) < 3:
+            sequence_raw = list(sequence_metrics)
+            while len(sequence_raw) < 3:
+                sequence_raw.insert(0, sequence_raw[0] if sequence_raw else np.zeros(13))
+            sequence_raw = sequence_raw[-3:]
+        else:
+            sequence_raw = list(sequence_metrics)[-3:]
+        normalized_sequence = helios_brain.scaler.transform(np.array(sequence_raw))
+        one_hot_action = np.zeros(len(MEDICAL_ACTIONS))
+        one_hot_action[MEDICAL_ACTIONS.index(action)] = 1
+        self.memory.append((normalized_sequence, one_hot_action, normalized_next_metrics))
+
+    def train(self) -> None:
+        if len(self.memory) < 1000:
+            return
+        batch = random.sample(self.memory, 256)
+        X_states = np.array([d[0] for d in batch])
+        X_actions = np.array([d[1] for d in batch])
+        Y = np.array([d[2] for d in batch])
+        self.model.fit([X_states, X_actions], Y, epochs=1, verbose=0)
+
+# --- Reward Estimation ---
+def estimate_reward(action: str, current_metrics: np.ndarray, next_metrics: np.ndarray) -> float:
+    stability_bonus = helios_policy.compute_stability_reward()
+    if action == "Alert Clinician":
+        return 1.5 if next_metrics[0] < 100 else -0.5 + stability_bonus
+    elif action == "Assess":
+        return 1.2 + stability_bonus
+    elif action == "Diagnose":
+        return 0.7 + stability_bonus
+    elif action == "Recommend Treatment":
+        return 1.0 if next_metrics[3] < current_metrics[3] else 0.0 + stability_bonus
+    elif action == "Monitor Closely":
+        return 0.5 + stability_bonus
+    elif action == "Schedule Follow-Up":
+        return 1.5 if next_metrics[12] < 5 else 0.0 + stability_bonus
+    elif action == "Refer Specialist":
+        return 0.8 + stability_bonus
+    elif action == "Adjust Medication":
+        return 1.0 + stability_bonus
+    elif action == "Provide Support":
+        return 1.2 if next_metrics[0] < current_metrics[0] else 0.0 + stability_bonus
+    elif action == "Reassess":
+        return 0.8 + stability_bonus
+    return stability_bonus
+
+# --- Predictive Model ---
+class PredictiveModel:
+    def __init__(self) -> None:
+        self.model = Sequential([
+            layers.Input(shape=(CONFIG.metrics_window, 13)),
+            layers.Bidirectional(layers.LSTM(64, return_sequences=True, dropout=0.2)),
+            layers.MultiHeadAttention(num_heads=2, key_dim=16),
+            layers.GlobalAveragePooling1D(),
+            layers.Dense(13)
+        ])
+        self.model.compile(optimizer="adam", loss="mse")
+        self.last_train_time = 0
+        self.train_interval = 20
+
+    def train(self, full_history: np.ndarray, force: bool = False, num_sequences: int = 100) -> None:
+        current_time = time.time()
+        if force or (current_time - self.last_train_time > self.train_interval * CONFIG.check_interval):
+            if len(full_history) > CONFIG.metrics_window:
+                num_available = len(full_history) - CONFIG.metrics_window
+                num_to_train = min(num_sequences, num_available)
+                indices = np.random.choice(num_available, num_to_train, replace=False)
+                X = np.array([full_history[i:i + CONFIG.metrics_window] for i in indices])
+                y = np.array([full_history[i + CONFIG.metrics_window] for i in indices])
+                self.model.fit(X, y, epochs=1, verbose=0)
+                self.last_train_time = current_time
+                STATE.logger.log_event("INFO", f"Predictive model trained on {num_to_train} sequences")
+
+    def predict(self, current: np.ndarray) -> np.ndarray:
+        return self.model.predict(current[None, :], verbose=0)[0]
+
+# --- Effectiveness Management ---
+class EffectivenessManager:
+    def __init__(self, file_path: str, backup_dir: str) -> None:
+        self.file_path = Path(file_path)
+        self.backup_dir = Path(backup_dir)
+        self.backup_dir.mkdir(exist_ok=True)
+        self.lock = threading.Lock()
+        self.load()
+
+    def load(self) -> None:
+        if self.file_path.exists():
+            try:
+                with self.file_path.open("r") as f:
+                    STATE.effectiveness = json.load(f)
+            except Exception as e:
+                STATE.logger.log_event("ERROR", f"Failed to load effectiveness: {str(e)}")
+                STATE.effectiveness = {}
+
+    def save(self) -> None:
+        with self.lock:
+            try:
+                with self.file_path.open("w") as f:
+                    json.dump(STATE.effectiveness, f)
+                backup_path = self.backup_dir / f"effectiveness_{int(time.time())}.json"
+                with backup_path.open("w") as f:
+                    json.dump(STATE.effectiveness, f)
+            except Exception as e:
+                STATE.logger.log_event("ERROR", f"Failed to save effectiveness: {str(e)}")
+
+    def update(self, action: str, success: bool) -> None:
+        STATE.effectiveness.setdefault(action, {"success": 0, "failure": 0})
+        key = "success" if success else "failure"
+        STATE.effectiveness[action][key] += 1
+
+    def get_effectiveness(self, action: str) -> float:
+        stats = STATE.effectiveness.get(action, {"success": 0, "failure": 0})
+        total = stats["success"] + stats["failure"]
+        return stats["success"] / total if total > 0 else 0.5
+
+# --- Chain of Thought Module ---
+class HeliosCoT:
+    def __init__(self, brain: MedicalBrain, policy: MedicalPolicy, logger: logging.Logger, dynamics: HeliosDynamics) -> None:
+        self.brain = brain
+        self.policy = policy
+        self.logger = logger
+        self.dynamics = dynamics
+        self.action_history = deque(maxlen=100)
+        self.rules = {
+            "Elevated Heart Rate": "Alert Clinician",
+            "Low Blood Pressure": "Recommend Treatment",
+            "Abnormal Temperature": "Assess",
+            "High Respiratory Rate": "Monitor Closely",
+        }
+
+    def assess_risk(self, metrics: np.ndarray, risk_score: float, cluster_distance: float) -> Dict[str, Any]:
+        if metrics[0] > 100:
+            risk_type = "Elevated Heart Rate"
+            metric_value = metrics[0]
+        elif metrics[1] < 90:
+            risk_type = "Low Blood Pressure"
+            metric_value = metrics[1]
+        elif metrics[3] > 38:
+            risk_type = "Abnormal Temperature"
+            metric_value = metrics[3]
+        elif metrics[4] > 20:
+            risk_type = "High Respiratory Rate"
+            metric_value = metrics[4]
+        else:
+            risk_type = "Unknown Risk"
+            metric_value = risk_score
+        persistent = False
+        severity = "high" if (persistent or risk_score > 0.9 or cluster_distance > 2.0) else "medium"
+        reasoning = {
+            "type": risk_type,
+            "value": float(metric_value),
+            "persistence": "persistent" if persistent else "sudden",
+            "severity": severity,
+            "risk_score": float(risk_score),
+            "cluster_distance": float(cluster_distance)
+        }
+        self.logger.log_event("INFO", f"Risk Assessment: {reasoning}")
+        return reasoning
+
+    def select_action(self, state: Tuple[int, int, int, int, int], assessment: Dict[str, Any]) -> str:
+        if assessment["type"] in self.rules:
+            action = self.rules[assessment["type"]]
+            self.logger.log_event("INFO", f"Rule-based action selected: {action}")
+        else:
+            if len(dynamics.memory) < 1000 or random.random() < self.policy.epsilon:
+                action = self.policy.choose_action(state)
+            else:
+                current_metrics = list(STATE.metrics_history)[-1]
+                if not self.brain.scaler_fitted:
+                    action = self.policy.choose_action(state)
+                else:
+                    if 'consciousness' in globals():
+                        action, expected_value = consciousness.imagine_future(current_metrics)
+                    else:
+                        normalized_current = self.brain.scaler.transform(current_metrics.reshape(1, -1))[0]
+                        expected_values = []
+                        for act in MEDICAL_ACTIONS:
+                            one_hot_action = np.zeros(len(MEDICAL_ACTIONS))
+                            one_hot_action[MEDICAL_ACTIONS.index(act)] = 1
+                            sequence_raw = list(STATE.metrics_history)[-3:] if len(STATE.metrics_history) >= 3 else [current_metrics] * 3
+                            normalized_sequence = self.brain.scaler.transform(np.array(sequence_raw))
+                            normalized_next = self.dynamics.model.predict([normalized_sequence[None, :], one_hot_action[None, :]], verbose=0)[0]
+                            raw_next = self.brain.scaler.inverse_transform([normalized_next])[0]
+                            risk_next, _, cluster_distance_next, _ = self.brain.predict(raw_next, use_history=False)
+                            next_state = compute_state(raw_next, risk_next, cluster_distance_next)
+                            max_q = np.max(self.policy.target_model.predict(np.array([next_state]), verbose=0)[0])
+                            reward = estimate_reward(act, current_metrics, raw_next)
+                            effectiveness_weight = eff_manager.get_effectiveness(act)
+                            expected_value = (reward + self.policy.gamma * max_q) * effectiveness_weight
+                            expected_values.append(expected_value)
+                        action = MEDICAL_ACTIONS[np.argmax(expected_values)]
+        reasoning = {
+            "risk_type": assessment["type"],
+            "risk_score": assessment["risk_score"],
+            "cluster_distance": assessment["cluster_distance"],
+            "selected_action": action
+        }
+        self.action_history.append((time.time(), action, reasoning, None))
+        return action
+
+    def evaluate_response(self, action: str, reward: float, pre_metrics: np.ndarray, post_metrics: np.ndarray) -> Dict[str, Any]:
+        risk_change = float(self.brain.predict(pre_metrics)[0] - self.brain.predict(post_metrics)[0])
+        success = reward > 0 and risk_change > 0
+        reasoning = {
+            "action": action,
+            "reward": reward,
+            "risk_change": risk_change,
+            "success": success,
+            "next_step": "Reassess strategy" if success else "Adjust plan"
+        }
+        if self.action_history and self.action_history[-1][1] == action:
+            timestamp, act, reason, _ = self.action_history[-1]
+            if 'consciousness' in globals():
+                reflection = consciousness.reflect(action, reward, pre_metrics, post_metrics)
+                reasoning["reflection"] = reflection
+            self.action_history[-1] = (timestamp, action, reason, reasoning)
+        self.logger.log_event("INFO", f"Response Evaluation: {reasoning}")
+        return reasoning
+
+    def proactive_step(self, current_metrics: np.ndarray, predicted_metrics: np.ndarray) -> Optional[str]:
+        current_risk = self.brain.predict(current_metrics)[0]
+        predicted_risk = self.brain.predict(predicted_metrics, use_history=False)[0]
+        if predicted_risk > CONFIG.risk_threshold and predicted_risk > current_risk + 0.15:
+            reasoning = f"Prediction: Risk score increases from {current_risk:.2f} to {predicted_risk:.2f}. Preemptive action required."
+            action = "Reassess"
+            self.logger.log_event("INFO", f"Proactive Step: {reasoning}")
+            return action
+        return None
+
+# --- Patient Data Acquisition (simulated) ---
+async def gather_patient_data() -> np.ndarray:
+    try:
+        heart_rate = random.uniform(60, 110)
+        bp_sys = random.uniform(90, 140)
+        bp_dia = random.uniform(60, 90)
+        temperature = random.uniform(36, 39)
+        resp_rate = random.uniform(12, 24)
+        spo2 = random.uniform(92, 100)
+        blood_sugar = random.uniform(80, 150)
+        cholesterol = random.uniform(150, 250)
+        weight = random.uniform(55, 100)
+        bmi = random.uniform(18, 30)
+        risk_score = random.uniform(0, 1)
+        age = random.randint(20, 80)
+        complaint_severity = random.uniform(0, 10)
+        metrics = np.array([heart_rate, bp_sys, bp_dia, temperature, resp_rate, spo2,
+                            blood_sugar, cholesterol, weight, bmi, risk_score, age, complaint_severity], dtype=np.float32)
+        for source in CONFIG.risk_intel_sources:
+            try:
+                headers = {"x-apikey": source["key"]} if "publichealth" in source["url"] else {"Key": source["key"], "Accept": "application/json"}
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                    async with session.get(source["url"], headers=headers) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if any(alert.get(source["risk_key"], 0) > 0.7 for alert in data.get(source["field"], [])):
+                                metrics[10] = min(1.0, metrics[10] + 0.2)
+                                STATE.logger.log_event("WARNING", "High risk alert from public health source")
+            except Exception as e:
+                STATE.logger.log_event("ERROR", f"Risk intel fetch failed from {source['url']}", {"error": str(e)})
+        return metrics
+    except Exception:
+        if STATE.metrics_history:
+            return np.array(list(STATE.metrics_history)[-1], dtype=np.float32)
+        return np.zeros(13, dtype=np.float32)
+
+# --- Health Check ---
+async def health_check(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: EffectivenessManager) -> None:
+    while STATE.active:
+        try:
+            if not brain.validate():
+                STATE.logger.log_event("WARNING", "Model validation failed; fine-tuning")
+                if len(brain.memory) >= 10:
+                    recent_data = np.array([m[0] for m in brain.memory[-100:]])
+                    labels = np.array([m[1] if m[1] is not None else 0 for m in brain.memory[-100:]]).reshape(-1, 1)
+                    y_pooled = np.zeros((len(recent_data), 32))
+                    brain.model.fit(recent_data, [recent_data, labels, y_pooled], epochs=1, verbose=0)
+                    STATE.logger.log_event("INFO", "Model fine-tuned with recent data")
+                else:
+                    STATE.logger.log_event("INFO", "Not enough data for fine-tuning")
+            eff_manager.save()
+            STATE.logger.log_event("INFO", "Health check completed")
+        except Exception as e:
+            STATE.logger.log_event("ERROR", f"Health check failed: {str(e)}")
+        await asyncio.sleep(CONFIG.health_check_interval)
+
+# --- Notification System ---
+def send_email(msg: EmailMessage) -> None:
+    try:
+        with smtplib.SMTP(CONFIG.email_smtp, CONFIG.email_port) as s:
+            s.starttls()
+            s.login(CONFIG.email_from, CONFIG.email_password)
+            s.send_message(msg)
+        STATE.logger.log_event("INFO", "Email alert sent")
+    except Exception as e:
+        STATE.logger.log_event("ERROR", f"Email alert failed", {"error": str(e)})
+
+async def send_notification(context: Dict[str, Any]) -> None:
+    msg_content = f"Helios alert: Critical patient risk detected! Details: {json.dumps(context, default=str)}"
+    if CONFIG.slack_webhook:
+        async with aiohttp.ClientSession() as session:
+            payload = {"text": msg_content}
+            async with session.post(CONFIG.slack_webhook, json=payload) as resp:
+                STATE.logger.log_event("INFO" if resp.status == 200 else "WARNING", f"Slack alert {'sent' if resp.status == 200 else 'failed'}", {"status": resp.status})
+    msg = EmailMessage()
+    msg.set_content(msg_content)
+    msg["Subject"] = "Helios Critical Alert"
+    msg["From"] = CONFIG.email_from
+    msg["To"] = CONFIG.email_to
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, send_email, msg)
+
+# --- State Computation ---
+def compute_state(metrics: np.ndarray, risk_score: float, cluster_distance: float) -> Tuple[int, int, int, int, int]:
+    risk_bins = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    hr_bins = [0, 60, 80, 100, 120, 200]
+    bp_bins = [0, 90, 120, 140, 160, 300]
+    temp_bins = [35, 36, 37, 38, 39, 41]
+    spo2_bins = [80, 90, 95, 98, 100]
+    risk_bin = np.digitize(risk_score, risk_bins) - 1
+    hr_bin = np.digitize(metrics[0], hr_bins) - 1
+    bp_bin = np.digitize(metrics[1], bp_bins) - 1
+    temp_bin = np.digitize(metrics[3], temp_bins) - 1
+    spo2_bin = np.digitize(metrics[5], spo2_bins) - 1
+    return (risk_bin, hr_bin, bp_bin, temp_bin, spo2_bin)
+
+# --- User Interaction ---
+def read_stdin(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:
+    while True:
+        try:
+            line = sys.stdin.readline().strip()
+            if line:
+                loop.call_soon_threadsafe(queue.put_nowait, line)
+        except Exception as e:
+            STATE.logger.log_event("ERROR", f"Error reading from stdin: {str(e)}")
+            break
+
+async def handle_user_input(queue: asyncio.Queue) -> None:
+    while STATE.active:
+        command = await queue.get()
+        response = process_command(command)
+        print(response)
+
+def process_command(command: str) -> str:
+    if command == "status":
+        if STATE.metrics_history:
+            metrics = STATE.metrics_history[-1]
+            thought = express_thought("detailed_status", {
+                "hr": metrics[0], "bp_sys": metrics[1], "bp_dia": metrics[2],
+                "temp": metrics[3], "rr": metrics[4], "spo2": metrics[5],
+                "sugar": metrics[6], "chol": metrics[7], "weight": metrics[8],
+                "bmi": metrics[9], "risk": metrics[10], "age": metrics[11],
+                "complaint": metrics[12]
+            })
+            return thought
+        return "No patient data available yet."
+    elif command == "explain_last_action":
+        if cot.action_history:
+            timestamp, action, reasoning, outcome = cot.action_history[-1]
+            explanation = express_thought("explain_action", {
+                "action": action,
+                "score": reasoning["risk_score"],
+                "metric_issue": reasoning["risk_type"],
+                "expected_outcome": "reduce the patient risk" if outcome and outcome["success"] else "improve patient condition"
+            })
+            return explanation
+        return "No actions have been taken yet."
+    else:
+        return "Unknown command. Try 'status' or 'explain_last_action'."
+
+# --- Core Control Logic ---
+async def helios_core(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: EffectivenessManager, cot: HeliosCoT) -> None:
+    global consciousness
+    consciousness = ConsciousnessModule(brain, policy, cot)
+    if not Clearance.verify():
+        STATE.active = False
+        return
+
+    STATE.logger.log_event("INFO", "Helios activated with consciousness module")
+    check_count = 0
+    predictive_model = PredictiveModel()
+    start_prometheus_server(port=8000)
+    while STATE.active:
+        check_count += 1
+        metrics = await gather_patient_data()
+        risk_score, risk_prob, cluster_distance, uncertainty = brain.predict(metrics)
+        STATE.risk_history.append(risk_score)
+        state = compute_state(metrics, risk_score, cluster_distance)
+        update_prometheus_gauges(metrics, risk_score)
+
+        CONFIG.check_interval = 0.1 if risk_score > 0.9 else 0.5 if risk_score > 0.7 else 1.0
+        batch_train = (check_count % CONFIG.batch_train_interval == 0)
+        brain.train(metrics, 1.0 if risk_prob > 0.5 else None, batch_train)
+
+        assessment = cot.assess_risk(metrics, risk_score, cluster_distance)
+        if risk_score > CONFIG.risk_threshold:
+            thought = express_thought("risk_detected", {"score": risk_score})
+            STATE.logger.log_event("INFO", thought)
+
+        if "covid19" in STATE.high_risk_factors or "influenza" in STATE.high_risk_factors:
+            action = "Alert Clinician"
+            thought = express_thought("action_selected", {"action": action})
+            STATE.logger.log_event("INFO", thought)
+            reward = await execute_action(action, {"risk_factors": list(STATE.high_risk_factors)}, eff_manager)
+            next_metrics = await gather_patient_data()
+            r_score, _, c_distance, _ = brain.predict(next_metrics)
+            next_state = compute_state(next_metrics, r_score, c_distance)
+            policy.learn(state, action, reward, next_state)
+            cot.evaluate_response(action, reward, metrics, next_metrics)
+            if brain.scaler_fitted:
+                dynamics.remember(list(STATE.metrics_history)[-3:], action, brain.scaler.transform(next_metrics.reshape(1, -1))[0])
+            thought = express_thought("action_executed", {"action": action, "reward": reward})
+            STATE.logger.log_event("INFO", thought)
+
+        proactive_freq = 3 if risk_score < 0.5 else 1
+        if check_count % proactive_freq == 0 and len(STATE.metrics_history) > CONFIG.metrics_window:
+            full_history = np.array(list(STATE.metrics_history))
+            predictive_model.train(full_history)
+            history = full_history[-CONFIG.metrics_window:]
+            future_metrics = predictive_model.predict(history)
+            proactive_action = cot.proactive_step(metrics, future_metrics)
+            if proactive_action:
+                thought = express_thought("action_selected", {"action": proactive_action})
+                STATE.logger.log_event("INFO", thought)
+                reward = await execute_action(proactive_action, {"predicted": True}, eff_manager)
+                policy.learn(state, proactive_action, reward, state)
+                if brain.scaler_fitted:
+                    dynamics.remember(list(STATE.metrics_history)[-3:], proactive_action, brain.scaler.transform(next_metrics.reshape(1, -1))[0])
+                thought = express_thought("action_executed", {"action": proactive_action, "reward": reward})
+                STATE.logger.log_event("INFO", thought)
+            else:
+                if random.random() < 0.2:
+                    predicted_hr = future_metrics[0]
+                    predicted_bp = future_metrics[1]
+                    thought = express_thought("prediction", {"predicted_hr": predicted_hr, "predicted_bp_sys": predicted_bp, "predicted_bp_dia": future_metrics[2]})
+                    STATE.logger.log_event("INFO", thought)
+
+        if risk_score > CONFIG.risk_threshold or cluster_distance > 2.0:
+            action = cot.select_action(state, assessment)
+            thought = express_thought("action_selected", {"action": action})
+            STATE.logger.log_event("INFO", thought)
+            pre_metrics = metrics.copy()
+            reward = await execute_action(action, {}, eff_manager)
+            next_metrics = await gather_patient_data()
+            r_score, _, c_distance, _ = brain.predict(next_metrics)
+            next_state = compute_state(next_metrics, r_score, c_distance)
+            policy.learn(state, action, reward, next_state)
+            cot.evaluate_response(action, reward, pre_metrics, next_metrics)
+            if brain.scaler_fitted:
+                dynamics.remember(list(STATE.metrics_history)[-3:], action, brain.scaler.transform(next_metrics.reshape(1, -1))[0])
+            thought = express_thought("action_executed", {"action": action, "reward": reward})
+            STATE.logger.log_event("INFO", thought)
+            brain.decay_epsilon()
+
+        if check_count % 10 == 0:
+            thought = express_thought("status_update", {
+                "hr": metrics[0], "bp_sys": metrics[1], "bp_dia": metrics[2],
+                "temp": metrics[3], "rr": metrics[4], "spo2": metrics[5]
+            })
+            STATE.logger.log_event("INFO", thought)
+
+        if check_count % 5 == 0:
+            threading.Thread(target=eff_manager.save, daemon=True).start()
+            threading.Thread(target=dynamics.train, daemon=True).start()
+
+        await asyncio.sleep(CONFIG.check_interval)
+
+# --- Watchdog ---
+def watchdog() -> None:
+    while True:
+        if not STATE.active:
+            STATE.active = True
+            asyncio.run(run_helios())
+        time.sleep(5)
+
+# --- Analysis and Reporting ---
+def analyze_system() -> None:
+    status = ("Helios is online and monitoring patient data",)
+    STATE.logger.log_event("INFO", "System analysis", {"status": status})
+    print(f"Helios Analysis: {status}")
+    print(f"High Risk Factors Count: {len(STATE.high_risk_factors)}")
+    print(f"Model Epsilon: {helios_brain.epsilon:.3f}")
+
+# --- Security Clearance ---
+class Clearance:
+    SYSTEM_SECURE = "Protected"
+    SYSTEM_COMPROMISED = "Compromised"
+    CURRENT_STATE = SYSTEM_SECURE
+
+    @staticmethod
+    def verify() -> bool:
+        import hashlib
+        current_hash = hashlib.sha256(str(os.getpid()).encode()).hexdigest()
+        if Clearance.CURRENT_STATE == Clearance.SYSTEM_COMPROMISED or current_hash != STATE.process_hash:
+            STATE.logger.log_event("WARNING", "System compromised: Security check failed")
+            return False
+        STATE.logger.log_event("INFO", "Security clearance verified")
+        return True
+
+# --- Action Execution ---
+async def execute_action(action: str, context: Dict[str, Any], eff_manager: EffectivenessManager) -> float:
+    current_time = time.time()
+    if current_time - STATE.last_action_time < CONFIG.action_cooldown:
+        return 0.0
+    STATE.last_action_time = current_time
+    metrics = await gather_patient_data()
+    predictive_model = PredictiveModel()
+    history = np.array(list(STATE.metrics_history)[-CONFIG.metrics_window:] if len(STATE.metrics_history) >= CONFIG.metrics_window else np.zeros((CONFIG.metrics_window, 13)))
+    simulated_metrics = predictive_model.predict(history)
+    simulated_risk = helios_brain.predict(simulated_metrics, use_history=False)[0]
+    reward = 0.0
+    try:
+        if action == "Alert Clinician":
+            await send_notification({"alert": "Patient requires immediate attention", "context": context})
+            reward = 1.5 if metrics[0] < 100 else -0.5
+            STATE.logger.log_event("INFO", "Clinician alerted for patient")
+        elif action == "Assess":
+            STATE.logger.log_event("INFO", "Patient assessment initiated")
+            reward = 1.2
+        elif action == "Diagnose":
+            STATE.logger.log_event("INFO", "Diagnostic tests recommended")
+            reward = 0.7
+        elif action == "Recommend Treatment":
+            reward = 1.0 if metrics[3] < current_time else 0.0 + 0.0
+            STATE.logger.log_event("INFO", "Treatment recommendation provided")
+        elif action == "Monitor Closely":
+            STATE.logger.log_event("INFO", "Increased monitoring scheduled")
+            reward = 0.5
+        elif action == "Schedule Follow-Up":
+            STATE.logger.log_event("INFO", "Follow-up appointment scheduled")
+            reward = 1.5
+        elif action == "Refer Specialist":
+            STATE.logger.log_event("INFO", "Patient referred to specialist")
+            reward = 0.8
+        elif action == "Adjust Medication":
+            STATE.logger.log_event("INFO", "Medication adjusted as per protocol")
+            reward = 1.0
+        elif action == "Provide Support":
+            STATE.logger.log_event("INFO", "Support services engaged for patient")
+            reward = 1.2
+        elif action == "Reassess":
+            STATE.logger.log_event("INFO", "Reassessment of patient condition initiated")
+            reward = 0.8
+        eff_manager.update(action, reward > 0)
+        return reward
+    except Exception as e:
+        STATE.logger.log_event("ERROR", f"Action '{action}' failed", {"error": str(e)})
+        eff_manager.update(action, False)
+        return -1.0
+
+# --- Main Execution ---
+async def run_helios() -> None:
+    global helios_brain, helios_policy, eff_manager, dynamics, cot, consciousness
+    helios_brain = MedicalBrain()
+    helios_policy = MedicalPolicy()
+    eff_manager = EffectivenessManager(CONFIG.effectiveness_file, CONFIG.backup_dir)
+    dynamics = HeliosDynamics()
+    cot = HeliosCoT(helios_brain, helios_policy, STATE.logger.logger, dynamics)
+
+    loop = asyncio.get_event_loop()
+    user_queue = asyncio.Queue()
+    thread = threading.Thread(target=read_stdin, args=(loop, user_queue), daemon=True)
+    thread.start()
+
+    loop.create_task(handle_user_input(user_queue))
+    await asyncio.gather(
+        helios_core(helios_brain, helios_policy, eff_manager, cot),
+        health_check(helios_brain, helios_policy, eff_manager),
+        STATE.logger.report_metrics()
+    )
+
+def signal_handler(sig, frame) -> None:
+    STATE.active = False
+    eff_manager.save()
+
+if __name__ == "__main__":
+    helios_brain = MedicalBrain()
+    helios_policy = MedicalPolicy()
+    eff_manager = EffectivenessManager(CONFIG.effectiveness_file, CONFIG.backup_dir)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    analyze_system()
+    for i in range(10):
+        print(f"{i * 10}% process completed...")
+        time.sleep(0.1)
+    print("Helios Online:")
+
+    try:
+        asyncio.run(run_helios())
+    except Exception as e:
+        STATE.logger.log_event("CRITICAL", "Helios crashed", {"error": str(e), "traceback": traceback.format_exc()})
+        STATE.active = False
