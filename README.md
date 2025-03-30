@@ -1,4 +1,4 @@
-Sure! Here is a detailed README for the Helios project:
+
 
 ---
 
