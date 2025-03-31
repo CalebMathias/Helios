@@ -138,6 +138,35 @@ Helios offers significant value to healthcare professionals and institutions by:
 
 In summary, Helios is a powerful tool that enhances patient care, improves operational efficiency, reduces risks, and leverages advanced AI to support healthcare professionals in delivering the best possible outcomes for their patients.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+![Screenshot 2025-03-30 172329](https://github.com/user-attachments/assets/25d53701-0888-41fc-914e-d56ea49c4685)
+
+
 ---
 
 
