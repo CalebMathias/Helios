@@ -164,13 +164,9 @@ In summary, Helios is a powerful tool that enhances patient care, improves opera
 
 
 
-![Screenshot 2025-03-30 172329](https://github.com/user-attachments/assets/25d53701-0888-41fc-914e-d56ea49c4685)
-
-![Screenshot 2025-03-30 172508](https://github.com/user-attachments/assets/022c0237-9cee-4805-99c4-b6a92c499595)
-![Screenshot 2025-03-30 172456](https://github.com/user-attachments/assets/89f9521e-697f-4d83-84b0-2097e235b6c8)
-![Screenshot 2025-03-30 172421](https://github.com/user-attachments/assets/b5ee0e8b-679e-4ac2-8544-4cab7527369a)
-![Screenshot 2025-03-30 172358](https://github.com/user-attachments/assets/3827c6ef-65fb-4ae2-b118-39fd44744a61)
-
----
-
+![Screenshot 2025-03-30 172508](https://github.com/user-attachments/assets/06a79552-cb6e-49c4-b78e-1d32cb776ee2)
+![Screenshot 2025-03-30 172456](https://github.com/user-attachments/assets/fcdd450e-a97f-4266-b451-c83fdfcb2678)
+![Screenshot 2025-03-30 172421](https://github.com/user-attachments/assets/cfbac6a8-8a00-464c-8c74-eb5121ecf249)
+![Screenshot 2025-03-30 172358](https://github.com/user-attachments/assets/9f5bcca0-410b-4318-b52e-652b16d1125c)
+![Screenshot 2025-03-30 172329](https://github.com/user-attachments/assets/88e98bd7-029a-4a96-975e-defeb6373fb7)
 
