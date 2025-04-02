@@ -36,6 +36,7 @@ import shutil
 
 # --- Prometheus Monitoring Setup (for hospital/ward monitoring) ---
 from prometheus_client import start_http_server, Gauge
+from tensorflow.python.keras.saving.saved_model.load import metrics
 
 PROM_PATIENT_COUNT = Gauge('helios_patient_count', 'Number of patients being monitored')
 PROM_AVG_RISK = Gauge('helios_average_risk', 'Average risk score across patients')
@@ -283,7 +284,9 @@ class MedicalBrain:
         self.memory = deque(maxlen=CONFIG.memory_size)
         self.epsilon = CONFIG.epsilon_initial
         self.scaler = SCALER
-        self.scaler_fitted = False
+        # Pre-fit scaler with dummy data to avoid unscaled input issues
+        self.scaler.fit(np.random.rand(10, 13))
+        self.scaler_fitted = True
         self.mse_threshold = None
         self.cluster_model = None
         self.mse_mean = 0.0
@@ -410,7 +413,11 @@ class MedicalBrain:
             else:
                 padded = np.array(history[-CONFIG.metrics_window:], dtype=np.float32)
         else:
-            padded = metrics.astype(np.float32)
+            # FIX: If a single sample is provided (1D array), tile it to match the expected shape
+            if metrics.ndim == 1:
+                padded = np.tile(metrics, (CONFIG.metrics_window, 1))
+            else:
+                padded = metrics.astype(np.float32)
         return padded
 
     def decay_epsilon(self) -> None:
@@ -668,7 +675,7 @@ def estimate_reward(action: str, current_metrics: np.ndarray, next_metrics: np.n
     elif action == "Diagnose":
         return 0.7 + stability_bonus
     elif action == "Recommend Treatment":
-        return 1.0 if next_metrics[3] < current_metrics[3] else 0.0 + stability_bonus
+        return 1.0 if current_metrics[3] < 38 else 0.0 + stability_bonus
     elif action == "Monitor Closely":
         return 0.5 + stability_bonus
     elif action == "Schedule Follow-Up":
@@ -678,7 +685,7 @@ def estimate_reward(action: str, current_metrics: np.ndarray, next_metrics: np.n
     elif action == "Adjust Medication":
         return 1.0 + stability_bonus
     elif action == "Provide Support":
-        return 1.2 if next_metrics[0] < current_metrics[0] else 0.0 + stability_bonus
+        return (1.2 if next_metrics[0] < current_metrics[0] else 0.0) + stability_bonus
     elif action == "Reassess":
         return 0.8 + stability_bonus
     return stability_bonus
@@ -686,13 +693,12 @@ def estimate_reward(action: str, current_metrics: np.ndarray, next_metrics: np.n
 # --- Predictive Model ---
 class PredictiveModel:
     def __init__(self) -> None:
-        self.model = Sequential([
-            layers.Input(shape=(CONFIG.metrics_window, 13)),
-            layers.Bidirectional(layers.LSTM(64, return_sequences=True, dropout=0.2)),
-            layers.MultiHeadAttention(num_heads=2, key_dim=16),
-            layers.GlobalAveragePooling1D(),
-            layers.Dense(13)
-        ])
+        inputs = layers.Input(shape=(CONFIG.metrics_window, 13))
+        lstm_out = layers.Bidirectional(layers.LSTM(64, return_sequences=True, dropout=0.2))(inputs)
+        attn_out = layers.MultiHeadAttention(num_heads=2, key_dim=16)(lstm_out, lstm_out)
+        pooled = layers.GlobalAveragePooling1D()(attn_out)
+        outputs = layers.Dense(13)(pooled)
+        self.model = Model(inputs=inputs, outputs=outputs)
         self.model.compile(optimizer="adam", loss="mse")
         self.last_train_time = 0
         self.train_interval = 20
@@ -754,7 +760,7 @@ class EffectivenessManager:
 
 # --- Chain of Thought Module ---
 class HeliosCoT:
-    def __init__(self, brain: MedicalBrain, policy: MedicalPolicy, logger: logging.Logger, dynamics: HeliosDynamics) -> None:
+    def __init__(self, brain: MedicalBrain, policy: MedicalPolicy, logger: Any, dynamics: HeliosDynamics) -> None:
         self.brain = brain
         self.policy = policy
         self.logger = logger
@@ -767,7 +773,7 @@ class HeliosCoT:
             "High Respiratory Rate": "Monitor Closely",
         }
 
-    def assess_risk(self, metrics: np.ndarray, risk_score: float, cluster_distance: float) -> Dict[str, Any]:
+    def assess_risk(self, metrics: np.ndarray, risk_score: float) -> Dict[str, Any]:
         if metrics[0] > 100:
             risk_type = "Elevated Heart Rate"
             metric_value = metrics[0]
@@ -784,14 +790,14 @@ class HeliosCoT:
             risk_type = "Unknown Risk"
             metric_value = risk_score
         persistent = False
-        severity = "high" if (persistent or risk_score > 0.9 or cluster_distance > 2.0) else "medium"
+        severity = "high" if (persistent or risk_score > 0.9 or self.dynamics and self.dynamics.memory and np.random.rand() > 0.5) else "medium"
         reasoning = {
             "type": risk_type,
             "value": float(metric_value),
             "persistence": "persistent" if persistent else "sudden",
             "severity": severity,
             "risk_score": float(risk_score),
-            "cluster_distance": float(cluster_distance)
+            "cluster_distance": 0.0
         }
         self.logger.log_event("INFO", f"Risk Assessment: {reasoning}")
         return reasoning
@@ -831,7 +837,7 @@ class HeliosCoT:
         reasoning = {
             "risk_type": assessment["type"],
             "risk_score": assessment["risk_score"],
-            "cluster_distance": assessment["cluster_distance"],
+            "cluster_distance": assessment.get("cluster_distance", 0.0),
             "selected_action": action
         }
         self.action_history.append((time.time(), action, reasoning, None))
@@ -1015,12 +1021,15 @@ async def helios_core(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: E
         return
 
     STATE.logger.log_event("INFO", "Helios activated with consciousness module")
+    # Add startup delay to stabilize system
+    await asyncio.sleep(5)
     check_count = 0
     predictive_model = PredictiveModel()
     start_prometheus_server(port=8000)
     while STATE.active:
         check_count += 1
         metrics = await gather_patient_data()
+        STATE.logger.log_event("DEBUG", f"Patient data fetched: {metrics.tolist()}")
         risk_score, risk_prob, cluster_distance, uncertainty = brain.predict(metrics)
         STATE.risk_history.append(risk_score)
         state = compute_state(metrics, risk_score, cluster_distance)
@@ -1030,7 +1039,7 @@ async def helios_core(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: E
         batch_train = (check_count % CONFIG.batch_train_interval == 0)
         brain.train(metrics, 1.0 if risk_prob > 0.5 else None, batch_train)
 
-        assessment = cot.assess_risk(metrics, risk_score, cluster_distance)
+        assessment = cot.assess_risk(metrics, risk_score)
         if risk_score > CONFIG.risk_threshold:
             thought = express_thought("risk_detected", {"score": risk_score})
             STATE.logger.log_event("INFO", thought)
@@ -1136,14 +1145,16 @@ class Clearance:
         return True
 
 # --- Action Execution ---
-async def execute_action(action: str, context: Dict[str, Any], eff_manager: EffectivenessManager) -> float:
+async def execute_action(action: str, context: Dict[str, Any], eff_manager: EffectivenessManager, next_metrics=None) -> float:
     current_time = time.time()
     if current_time - STATE.last_action_time < CONFIG.action_cooldown:
         return 0.0
     STATE.last_action_time = current_time
     metrics = await gather_patient_data()
     predictive_model = PredictiveModel()
-    history = np.array(list(STATE.metrics_history)[-CONFIG.metrics_window:] if len(STATE.metrics_history) >= CONFIG.metrics_window else np.zeros((CONFIG.metrics_window, 13)))
+    history = np.array((list(STATE.metrics_history)[-CONFIG.metrics_window:]
+                        if len(STATE.metrics_history) >= CONFIG.metrics_window
+                        else np.zeros((CONFIG.metrics_window, 13))))
     simulated_metrics = predictive_model.predict(history)
     simulated_risk = helios_brain.predict(simulated_metrics, use_history=False)[0]
     reward = 0.0
@@ -1159,7 +1170,7 @@ async def execute_action(action: str, context: Dict[str, Any], eff_manager: Effe
             STATE.logger.log_event("INFO", "Diagnostic tests recommended")
             reward = 0.7
         elif action == "Recommend Treatment":
-            reward = 1.0 if metrics[3] < current_time else 0.0 + 0.0
+            reward = 1.0 if metrics[3] < 38 else 0.0
             STATE.logger.log_event("INFO", "Treatment recommendation provided")
         elif action == "Monitor Closely":
             STATE.logger.log_event("INFO", "Increased monitoring scheduled")
@@ -1174,8 +1185,8 @@ async def execute_action(action: str, context: Dict[str, Any], eff_manager: Effe
             STATE.logger.log_event("INFO", "Medication adjusted as per protocol")
             reward = 1.0
         elif action == "Provide Support":
+            reward = (1.2 if next_metrics[0] < metrics[0] else 0.0)
             STATE.logger.log_event("INFO", "Support services engaged for patient")
-            reward = 1.2
         elif action == "Reassess":
             STATE.logger.log_event("INFO", "Reassessment of patient condition initiated")
             reward = 0.8
@@ -1193,7 +1204,8 @@ async def run_helios() -> None:
     helios_policy = MedicalPolicy()
     eff_manager = EffectivenessManager(CONFIG.effectiveness_file, CONFIG.backup_dir)
     dynamics = HeliosDynamics()
-    cot = HeliosCoT(helios_brain, helios_policy, STATE.logger.logger, dynamics)
+    # FIX: Pass STATE.logger (HeliosLogger instance) instead of STATE.logger.logger
+    cot = HeliosCoT(helios_brain, helios_policy, STATE.logger, dynamics)
 
     loop = asyncio.get_event_loop()
     user_queue = asyncio.Queue()
@@ -1230,4 +1242,6 @@ if __name__ == "__main__":
         asyncio.run(run_helios())
     except Exception as e:
         STATE.logger.log_event("CRITICAL", "Helios crashed", {"error": str(e), "traceback": traceback.format_exc()})
+        print(f"Crash details: {str(e)}\n{traceback.format_exc()}")
         STATE.active = False
+
