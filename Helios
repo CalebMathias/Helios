@@ -34,9 +34,8 @@ import sys
 import traceback
 import shutil
 
-# --- Prometheus Monitoring Setup (for hospital/ward monitoring) ---
+# --- Prometheus Monitoring Setup ---
 from prometheus_client import start_http_server, Gauge
-from tensorflow.python.keras.saving.saved_model.load import metrics
 
 PROM_PATIENT_COUNT = Gauge('helios_patient_count', 'Number of patients being monitored')
 PROM_AVG_RISK = Gauge('helios_average_risk', 'Average risk score across patients')
@@ -85,33 +84,42 @@ class HeliosConfig:
 
 CONFIG = HeliosConfig()
 
-# --- Thought Templates for Human-Like Medical Communication ---
+# --- Enhanced Thought Templates ---
 THOUGHT_TEMPLATES = {
     "risk_detected": [
         "Patient data indicates an elevated risk score of {score:.2f}. This requires prompt attention.",
         "Alert: Elevated risk detected with score {score:.2f}. Initiating further analysis.",
-        "Abnormal vital signs detected: risk score at {score:.2f}."
+        "Abnormal vital signs detected: risk score at {score:.2f}.",
+        "Critical: {vital_sign} is {value:.1f}, which is {deviation} from normal. Risk score: {score:.2f}.",
+        "Multiple anomalies detected: {abnormal_vitals}. Risk score: {score:.2f}.",
     ],
     "action_selected": [
         "I recommend to {action} for further evaluation.",
         "Based on patient data, {action} seems to be the best next step.",
-        "Let's proceed to {action} to manage the situation."
+        "Let's proceed to {action} to manage the situation.",
+        "Due to {reason}, I suggest {action}.",
+        "Given the {assessment_type}, {action} is the recommended course of action.",
     ],
     "action_executed": [
         "Action {action} has been executed. Outcome measure: {reward:.2f}.",
         "I have just completed {action}; the response metric was {reward:.2f}.",
-        "After {action}, the patient status improved with a benefit score of {reward:.2f}."
+        "After {action}, the patient status improved with a benefit score of {reward:.2f}.",
+        "{action} resulted in {outcome}. Reward: {reward:.2f}.",
+        "Following {action}, the patient's {vital_sign} changed from {pre_value:.1f} to {post_value:.1f}.",
     ],
     "status_update": [
         "Patient vitals: Heart rate {hr:.1f} bpm, BP {bp_sys:.1f}/{bp_dia:.1f} mmHg, Temp {temp:.1f}°C, SpO2 {spo2:.1f}%.",
-        "Current vitals: HR {hr:.1f}, BP {bp_sys:.1f}/{bp_dia:.1f}, Temp {temp:.1f}°C, Respiratory rate {rr:.1f}."
+        "Current vitals: HR {hr:.1f}, BP {bp_sys:.1f}/{bp_dia:.1f}, Temp {temp:.1f}°C, Respiratory rate {rr:.1f}.",
+        "Vital signs overview: HR {hr:.1f} bpm ({hr_trend}), BP {bp_sys:.1f}/{bp_dia:.1f} mmHg ({bp_trend}), Temp {temp:.1f}°C ({temp_trend}), RR {rr:.1f} ({rr_trend}), SpO2 {spo2:.1f}% ({spo2_trend}).",
     ],
     "prediction": [
         "I predict that the patient's heart rate might reach {predicted_hr:.1f} bpm soon. Monitoring closely.",
-        "Forecast indicates a potential change in blood pressure to {predicted_bp_sys:.1f}/{predicted_bp_dia:.1f} mmHg."
+        "Forecast indicates a potential change in blood pressure to {predicted_bp_sys:.1f}/{predicted_bp_dia:.1f} mmHg.",
+        "Based on current trends, {vital_sign} is expected to {change} to {predicted_value:.1f}.",
     ],
     "explain_action": [
-        "I chose to {action} because the risk score was {score:.2f} and the vitals indicate {metric_issue}. This should {expected_outcome}."
+        "I chose to {action} because the risk score was {score:.2f} and the vitals indicate {metric_issue}. This should {expected_outcome}.",
+        "The decision to {action} was made due to {reason}. Expected outcome: {expected_outcome}.",
     ],
     "detailed_status": [
         "Detailed patient data: HR {hr:.1f} bpm, BP {bp_sys:.1f}/{bp_dia:.1f} mmHg, Temp {temp:.1f}°C, RR {rr:.1f}, SpO2 {spo2:.1f}%, Blood Sugar {sugar:.1f} mg/dL, Cholesterol {chol:.1f} mg/dL, BMI {bmi:.1f}, Age {age}, Complaint Severity {complaint}."
@@ -119,11 +127,16 @@ THOUGHT_TEMPLATES = {
 }
 
 def express_thought(event: str, context: Dict[str, Any]) -> str:
+    """Generate a human-like message based on event and context."""
     templates = THOUGHT_TEMPLATES.get(event, [""])
     template = random.choice(templates)
-    return template.format(**context)
+    try:
+        return template.format(**context)
+    except KeyError as e:
+        STATE.logger.log_event("WARNING", f"Missing key in context for event {event}: {e}")
+        return template
 
-# --- Positional Encoding Layer (unchanged) ---
+# --- Positional Encoding Layer ---
 class PositionalEncoding(layers.Layer):
     def __init__(self, position: int, d_model: int) -> None:
         super(PositionalEncoding, self).__init__()
@@ -147,7 +160,7 @@ class PositionalEncoding(layers.Layer):
     def call(self, inputs: tf.Tensor) -> tf.Tensor:
         return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
 
-# --- Transformer Encoder Layer (unchanged) ---
+# --- Transformer Encoder Layer ---
 class TransformerEncoderLayer(layers.Layer):
     def __init__(self, d_model: int, num_heads: int, ff_dim: int, dropout: float = 0.1) -> None:
         super(TransformerEncoderLayer, self).__init__()
@@ -226,9 +239,11 @@ class HeliosLogger:
             severe_count = sum(1 for _, lvl, _ in self.alert_queue if lvl in ("WARNING", "ERROR", "CRITICAL"))
             severe_recent = sum(1 for t, lvl, _ in self.alert_queue if lvl in ("WARNING", "ERROR", "CRITICAL") and current_time - t < 60)
             if severe_recent > 10:
-                asyncio.create_task(self._send_log_alert(severe_recent, "High rate of severe logs detected"))
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(self._send_log_alert(severe_recent, "High rate of severe logs detected")))
             if severe_count >= 30 and current_time - self.log_metrics["last_alert_time"] > 3600:
-                asyncio.create_task(self._send_log_alert(severe_count))
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(self._send_log_alert(severe_count)))
                 self.log_metrics["last_alert_time"] = current_time
 
     async def _send_log_alert(self, count: int, extra_msg: str = "") -> None:
@@ -262,10 +277,10 @@ class SystemState:
 STATE = SystemState()
 logger = STATE.logger.logger
 
-# Define medical actions to be recommended
+# Define medical actions
 MEDICAL_ACTIONS = ["Assess", "Diagnose", "Recommend Treatment", "Monitor Closely", "Alert Clinician", "Schedule Follow-Up", "Refer Specialist", "Adjust Medication", "Provide Support", "Reassess"]
 
-# Ideal state for patient vitals (example values for 13 metrics):
+# Ideal patient state
 IDEAL_PATIENT_STATE = np.array([70, 120, 80, 36.8, 16, 98, 90, 180, 70, 22, 0.0, 40, 0])
 
 SCALER = StandardScaler()
@@ -284,7 +299,6 @@ class MedicalBrain:
         self.memory = deque(maxlen=CONFIG.memory_size)
         self.epsilon = CONFIG.epsilon_initial
         self.scaler = SCALER
-        # Pre-fit scaler with dummy data to avoid unscaled input issues
         self.scaler.fit(np.random.rand(10, 13))
         self.scaler_fitted = True
         self.mse_threshold = None
@@ -331,7 +345,7 @@ class MedicalBrain:
             model = build()
         return model
 
-    def predict(self, metrics: np.ndarray, use_history: bool = True, mc_runs: int = 10) -> Tuple[float, float, float, float]:
+    def next_metrics(self, metrics: np.ndarray, use_history: bool = True, mc_runs: int = 10) -> Tuple[float, float, float, float]:
         padded = self._prepare_metrics(metrics, use_history)
         if self.scaler_fitted:
             normalized = self.scaler.transform(padded).astype(np.float32)
@@ -380,7 +394,7 @@ class MedicalBrain:
             batch_data = random.sample(self.memory, self.batch_size)
             X = np.array([d[0] for d in batch_data])
             y_recon = X
-            y_risk = np.array([d[1] if d[1] is not None else self.predict(d[0])[1] for d in batch_data]).reshape(-1, 1)
+            y_risk = np.array([d[1] if d[1] is not None else self.next_metrics(d[0])[1] for d in batch_data]).reshape(-1, 1)
             y_pooled = np.zeros((self.batch_size, 32))
             loss = self.model.train_on_batch(X, [y_recon, y_risk, y_pooled])
             STATE.logger.log_event("INFO", f"Online training completed, loss: {loss}")
@@ -413,7 +427,6 @@ class MedicalBrain:
             else:
                 padded = np.array(history[-CONFIG.metrics_window:], dtype=np.float32)
         else:
-            # FIX: If a single sample is provided (1D array), tile it to match the expected shape
             if metrics.ndim == 1:
                 padded = np.tile(metrics, (CONFIG.metrics_window, 1))
             else:
@@ -458,7 +471,7 @@ class HolographicMemory:
         indices = np.argsort(similarities)[-top_k:][::-1]
         return indices, similarities[indices]
 
-# --- Consciousness Module for Medical Reasoning ---
+# --- Consciousness Module ---
 class ConsciousnessModule:
     def __init__(self, brain: MedicalBrain, policy: 'MedicalPolicy', cot: 'HeliosCoT') -> None:
         self.brain = brain
@@ -471,7 +484,7 @@ class ConsciousnessModule:
 
     def update_self_state(self, metrics: np.ndarray) -> None:
         self.self_state = metrics.copy()
-        risk_score, _, _, _ = self.brain.predict(metrics)
+        risk_score, _, _, _ = self.brain.next_metrics(metrics)
         deviation = np.mean(np.abs(metrics - self.homeostatic_target) / (self.homeostatic_target + 1e-8))
         self.emotional_valence = np.clip(1.0 - (risk_score + deviation), -1.0, 1.0)
         STATE.logger.log_event("INFO", f"Updated patient state. Confidence level: {self.emotional_valence:.2f}")
@@ -509,7 +522,7 @@ class ConsciousnessModule:
                 best_action = action
         return best_action, best_value
 
-# --- Medical Policy (Dueling DQN with Prioritized Experience Replay) ---
+# --- Medical Policy ---
 class PrioritizedReplayBuffer:
     def __init__(self, capacity: int):
         self.capacity = capacity
@@ -826,7 +839,7 @@ class HeliosCoT:
                             normalized_sequence = self.brain.scaler.transform(np.array(sequence_raw))
                             normalized_next = self.dynamics.model.predict([normalized_sequence[None, :], one_hot_action[None, :]], verbose=0)[0]
                             raw_next = self.brain.scaler.inverse_transform([normalized_next])[0]
-                            risk_next, _, cluster_distance_next, _ = self.brain.predict(raw_next, use_history=False)
+                            risk_next, _, cluster_distance_next, _ = self.brain.next_metrics(raw_next, use_history=False)
                             next_state = compute_state(raw_next, risk_next, cluster_distance_next)
                             max_q = np.max(self.policy.target_model.predict(np.array([next_state]), verbose=0)[0])
                             reward = estimate_reward(act, current_metrics, raw_next)
@@ -844,7 +857,7 @@ class HeliosCoT:
         return action
 
     def evaluate_response(self, action: str, reward: float, pre_metrics: np.ndarray, post_metrics: np.ndarray) -> Dict[str, Any]:
-        risk_change = float(self.brain.predict(pre_metrics)[0] - self.brain.predict(post_metrics)[0])
+        risk_change = float(self.brain.next_metrics(pre_metrics)[0] - self.brain.next_metrics(post_metrics)[0])
         success = reward > 0 and risk_change > 0
         reasoning = {
             "action": action,
@@ -863,8 +876,8 @@ class HeliosCoT:
         return reasoning
 
     def proactive_step(self, current_metrics: np.ndarray, predicted_metrics: np.ndarray) -> Optional[str]:
-        current_risk = self.brain.predict(current_metrics)[0]
-        predicted_risk = self.brain.predict(predicted_metrics, use_history=False)[0]
+        current_risk = self.brain.next_metrics(current_metrics)[0]
+        predicted_risk = self.brain.next_metrics(predicted_metrics, use_history=False)[0]
         if predicted_risk > CONFIG.risk_threshold and predicted_risk > current_risk + 0.15:
             reasoning = f"Prediction: Risk score increases from {current_risk:.2f} to {predicted_risk:.2f}. Preemptive action required."
             action = "Reassess"
@@ -872,7 +885,7 @@ class HeliosCoT:
             return action
         return None
 
-# --- Patient Data Acquisition (simulated) ---
+# --- Patient Data Acquisition ---
 async def gather_patient_data() -> np.ndarray:
     try:
         heart_rate = random.uniform(60, 110)
@@ -930,14 +943,19 @@ async def health_check(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: 
 
 # --- Notification System ---
 def send_email(msg: EmailMessage) -> None:
+    if not CONFIG.email_password:
+        STATE.logger.log_event("ERROR", "Email password not set. Please set HELIOS_EMAIL_PASSWORD environment variable.")
+        return
     try:
         with smtplib.SMTP(CONFIG.email_smtp, CONFIG.email_port) as s:
             s.starttls()
             s.login(CONFIG.email_from, CONFIG.email_password)
             s.send_message(msg)
         STATE.logger.log_event("INFO", "Email alert sent")
+    except smtplib.SMTPAuthenticationError as e:
+        STATE.logger.log_event("ERROR", f"Email authentication failed. Check credentials: {str(e)}")
     except Exception as e:
-        STATE.logger.log_event("ERROR", f"Email alert failed", {"error": str(e)})
+        STATE.logger.log_event("ERROR", f"Email alert failed: {str(e)}")
 
 async def send_notification(context: Dict[str, Any]) -> None:
     msg_content = f"Helios alert: Critical patient risk detected! Details: {json.dumps(context, default=str)}"
@@ -989,24 +1007,32 @@ def process_command(command: str) -> str:
     if command == "status":
         if STATE.metrics_history:
             metrics = STATE.metrics_history[-1]
-            thought = express_thought("detailed_status", {
-                "hr": metrics[0], "bp_sys": metrics[1], "bp_dia": metrics[2],
-                "temp": metrics[3], "rr": metrics[4], "spo2": metrics[5],
-                "sugar": metrics[6], "chol": metrics[7], "weight": metrics[8],
-                "bmi": metrics[9], "risk": metrics[10], "age": metrics[11],
-                "complaint": metrics[12]
-            })
+            if len(STATE.metrics_history) >= 2:
+                prev_metrics = STATE.metrics_history[-2]
+                hr_change = metrics[0] - prev_metrics[0]
+                bp_change = metrics[1] - prev_metrics[1]
+                temp_change = metrics[3] - prev_metrics[3]
+                thought = f"Current vitals: HR {metrics[0]:.1f} bpm (change: {hr_change:.1f}), BP {metrics[1]:.1f}/{metrics[2]:.1f} mmHg (change: {bp_change:.1f}/{metrics[2] - prev_metrics[2]:.1f}), Temp {metrics[3]:.1f}°C (change: {temp_change:.1f}), RR {metrics[4]:.1f}, SpO2 {metrics[5]:.1f}%, Blood Sugar {metrics[6]:.1f} mg/dL, Cholesterol {metrics[7]:.1f} mg/dL, BMI {metrics[9]:.1f}, Age {metrics[11]}, Complaint Severity {metrics[12]:.1f}."
+            else:
+                thought = express_thought("detailed_status", {
+                    "hr": metrics[0], "bp_sys": metrics[1], "bp_dia": metrics[2],
+                    "temp": metrics[3], "rr": metrics[4], "spo2": metrics[5],
+                    "sugar": metrics[6], "chol": metrics[7], "weight": metrics[8],
+                    "bmi": metrics[9], "risk": metrics[10], "age": metrics[11],
+                    "complaint": metrics[12]
+                })
             return thought
         return "No patient data available yet."
     elif command == "explain_last_action":
         if cot.action_history:
             timestamp, action, reasoning, outcome = cot.action_history[-1]
-            explanation = express_thought("explain_action", {
-                "action": action,
-                "score": reasoning["risk_score"],
-                "metric_issue": reasoning["risk_type"],
-                "expected_outcome": "reduce the patient risk" if outcome and outcome["success"] else "improve patient condition"
-            })
+            if outcome:
+                success = 'success' if outcome['success'] else 'failure'
+                risk_change = outcome['risk_change']
+            else:
+                success = 'unknown'
+                risk_change = 0.0
+            explanation = f"Last action: {action}. Reason: {reasoning['risk_type']}. Outcome: {success}. Risk change: {risk_change:.2f}."
             return explanation
         return "No actions have been taken yet."
     else:
@@ -1021,7 +1047,6 @@ async def helios_core(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: E
         return
 
     STATE.logger.log_event("INFO", "Helios activated with consciousness module")
-    # Add startup delay to stabilize system
     await asyncio.sleep(5)
     check_count = 0
     predictive_model = PredictiveModel()
@@ -1030,7 +1055,7 @@ async def helios_core(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: E
         check_count += 1
         metrics = await gather_patient_data()
         STATE.logger.log_event("DEBUG", f"Patient data fetched: {metrics.tolist()}")
-        risk_score, risk_prob, cluster_distance, uncertainty = brain.predict(metrics)
+        risk_score, risk_prob, cluster_distance, uncertainty = brain.next_metrics(metrics)
         STATE.risk_history.append(risk_score)
         state = compute_state(metrics, risk_score, cluster_distance)
         update_prometheus_gauges(metrics, risk_score)
@@ -1041,22 +1066,48 @@ async def helios_core(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: E
 
         assessment = cot.assess_risk(metrics, risk_score)
         if risk_score > CONFIG.risk_threshold:
-            thought = express_thought("risk_detected", {"score": risk_score})
+            abnormal_vitals = []
+            if metrics[0] > 100:
+                abnormal_vitals.append(f"heart rate {metrics[0]:.1f} bpm")
+            if metrics[1] < 90:
+                abnormal_vitals.append(f"systolic BP {metrics[1]:.1f} mmHg")
+            if metrics[3] > 38:
+                abnormal_vitals.append(f"temperature {metrics[3]:.1f}°C")
+            if metrics[4] > 20:
+                abnormal_vitals.append(f"respiratory rate {metrics[4]:.1f}")
+            if abnormal_vitals:
+                vital_sign = abnormal_vitals[0].split()[0]
+                value = metrics[0] if vital_sign == "heart" else metrics[1] if vital_sign == "systolic" else metrics[3] if vital_sign == "temperature" else metrics[4]
+                deviation = "high" if vital_sign in ["heart", "temperature", "respiratory"] else "low"
+                context = {
+                    "score": risk_score,
+                    "vital_sign": vital_sign,
+                    "value": value,
+                    "deviation": deviation,
+                    "abnormal_vitals": ", ".join(abnormal_vitals)
+                }
+            else:
+                context = {"score": risk_score}
+            thought = express_thought("risk_detected", context)
             STATE.logger.log_event("INFO", thought)
 
         if "covid19" in STATE.high_risk_factors or "influenza" in STATE.high_risk_factors:
             action = "Alert Clinician"
-            thought = express_thought("action_selected", {"action": action})
+            reason = "high risk factors present"
+            context = {"action": action, "reason": reason}
+            thought = express_thought("action_selected", context)
             STATE.logger.log_event("INFO", thought)
             reward = await execute_action(action, {"risk_factors": list(STATE.high_risk_factors)}, eff_manager)
             next_metrics = await gather_patient_data()
-            r_score, _, c_distance, _ = brain.predict(next_metrics)
+            r_score, _, c_distance, _ = brain.next_metrics(next_metrics)
             next_state = compute_state(next_metrics, r_score, c_distance)
             policy.learn(state, action, reward, next_state)
             cot.evaluate_response(action, reward, metrics, next_metrics)
             if brain.scaler_fitted:
                 dynamics.remember(list(STATE.metrics_history)[-3:], action, brain.scaler.transform(next_metrics.reshape(1, -1))[0])
-            thought = express_thought("action_executed", {"action": action, "reward": reward})
+            outcome = "improvement" if reward > 0 else "no improvement"
+            context = {"action": action, "reward": reward, "outcome": outcome}
+            thought = express_thought("action_executed", context)
             STATE.logger.log_event("INFO", thought)
 
         proactive_freq = 3 if risk_score < 0.5 else 1
@@ -1067,43 +1118,71 @@ async def helios_core(brain: MedicalBrain, policy: MedicalPolicy, eff_manager: E
             future_metrics = predictive_model.predict(history)
             proactive_action = cot.proactive_step(metrics, future_metrics)
             if proactive_action:
-                thought = express_thought("action_selected", {"action": proactive_action})
+                reason = "predicted risk increase"
+                context = {"action": proactive_action, "reason": reason}
+                thought = express_thought("action_selected", context)
                 STATE.logger.log_event("INFO", thought)
                 reward = await execute_action(proactive_action, {"predicted": True}, eff_manager)
                 policy.learn(state, proactive_action, reward, state)
                 if brain.scaler_fitted:
                     dynamics.remember(list(STATE.metrics_history)[-3:], proactive_action, brain.scaler.transform(next_metrics.reshape(1, -1))[0])
-                thought = express_thought("action_executed", {"action": proactive_action, "reward": reward})
+                outcome = "improvement" if reward > 0 else "no improvement"
+                context = {"action": proactive_action, "reward": reward, "outcome": outcome}
+                thought = express_thought("action_executed", context)
                 STATE.logger.log_event("INFO", thought)
             else:
                 if random.random() < 0.2:
-                    predicted_hr = future_metrics[0]
-                    predicted_bp = future_metrics[1]
-                    thought = express_thought("prediction", {"predicted_hr": predicted_hr, "predicted_bp_sys": predicted_bp, "predicted_bp_dia": future_metrics[2]})
+                    predicted_change = np.abs(future_metrics - metrics)
+                    max_change_index = np.argmax(predicted_change)
+                    vital_signs = ["heart rate", "systolic BP", "diastolic BP", "temperature", "respiratory rate", "SpO2", "blood sugar", "cholesterol", "weight", "BMI", "risk score", "age", "complaint severity"]
+                    vital_sign = vital_signs[max_change_index]
+                    predicted_value = future_metrics[max_change_index]
+                    change = "increase" if future_metrics[max_change_index] > metrics[max_change_index] else "decrease"
+                    context = {"vital_sign": vital_sign, "predicted_value": predicted_value, "change": change}
+                    thought = express_thought("prediction", context)
                     STATE.logger.log_event("INFO", thought)
 
         if risk_score > CONFIG.risk_threshold or cluster_distance > 2.0:
             action = cot.select_action(state, assessment)
-            thought = express_thought("action_selected", {"action": action})
+            reason = assessment["type"].lower()
+            context = {"action": action, "reason": reason}
+            thought = express_thought("action_selected", context)
             STATE.logger.log_event("INFO", thought)
             pre_metrics = metrics.copy()
             reward = await execute_action(action, {}, eff_manager)
             next_metrics = await gather_patient_data()
-            r_score, _, c_distance, _ = brain.predict(next_metrics)
+            r_score, _, c_distance, _ = brain.next_metrics(next_metrics)
             next_state = compute_state(next_metrics, r_score, c_distance)
             policy.learn(state, action, reward, next_state)
             cot.evaluate_response(action, reward, pre_metrics, next_metrics)
             if brain.scaler_fitted:
                 dynamics.remember(list(STATE.metrics_history)[-3:], action, brain.scaler.transform(next_metrics.reshape(1, -1))[0])
-            thought = express_thought("action_executed", {"action": action, "reward": reward})
+            outcome = "improvement" if reward > 0 else "no improvement"
+            vital_sign = "heart rate" if assessment["type"] == "Elevated Heart Rate" else "blood pressure" if assessment["type"] == "Low Blood Pressure" else "temperature" if assessment["type"] == "Abnormal Temperature" else "respiratory rate"
+            pre_value = pre_metrics[0] if vital_sign == "heart rate" else pre_metrics[1] if vital_sign == "blood pressure" else pre_metrics[3] if vital_sign == "temperature" else pre_metrics[4]
+            post_value = next_metrics[0] if vital_sign == "heart rate" else next_metrics[1] if vital_sign == "blood pressure" else next_metrics[3] if vital_sign == "temperature" else next_metrics[4]
+            context = {"action": action, "reward": reward, "outcome": outcome, "vital_sign": vital_sign, "pre_value": pre_value, "post_value": post_value}
+            thought = express_thought("action_executed", context)
             STATE.logger.log_event("INFO", thought)
             brain.decay_epsilon()
 
         if check_count % 10 == 0:
-            thought = express_thought("status_update", {
+            if len(STATE.metrics_history) >= 2:
+                prev_metrics = STATE.metrics_history[-2]
+                hr_trend = "increasing" if metrics[0] > prev_metrics[0] else "decreasing" if metrics[0] < prev_metrics[0] else "stable"
+                bp_trend = "increasing" if metrics[1] > prev_metrics[1] else "decreasing" if metrics[1] < prev_metrics[1] else "stable"
+                temp_trend = "increasing" if metrics[3] > prev_metrics[3] else "decreasing" if metrics[3] < prev_metrics[3] else "stable"
+                rr_trend = "increasing" if metrics[4] > prev_metrics[4] else "decreasing" if metrics[4] < prev_metrics[4] else "stable"
+                spo2_trend = "increasing" if metrics[5] > prev_metrics[5] else "decreasing" if metrics[5] < prev_metrics[5] else "stable"
+            else:
+                hr_trend = bp_trend = temp_trend = rr_trend = spo2_trend = "unknown"
+            context = {
                 "hr": metrics[0], "bp_sys": metrics[1], "bp_dia": metrics[2],
-                "temp": metrics[3], "rr": metrics[4], "spo2": metrics[5]
-            })
+                "temp": metrics[3], "rr": metrics[4], "spo2": metrics[5],
+                "hr_trend": hr_trend, "bp_trend": bp_trend, "temp_trend": temp_trend,
+                "rr_trend": rr_trend, "spo2_trend": spo2_trend
+            }
+            thought = express_thought("status_update", context)
             STATE.logger.log_event("INFO", thought)
 
         if check_count % 5 == 0:
@@ -1156,7 +1235,7 @@ async def execute_action(action: str, context: Dict[str, Any], eff_manager: Effe
                         if len(STATE.metrics_history) >= CONFIG.metrics_window
                         else np.zeros((CONFIG.metrics_window, 13))))
     simulated_metrics = predictive_model.predict(history)
-    simulated_risk = helios_brain.predict(simulated_metrics, use_history=False)[0]
+    simulated_risk = helios_brain.next_metrics(simulated_metrics, use_history=False)[0]
     reward = 0.0
     try:
         if action == "Alert Clinician":
@@ -1204,7 +1283,6 @@ async def run_helios() -> None:
     helios_policy = MedicalPolicy()
     eff_manager = EffectivenessManager(CONFIG.effectiveness_file, CONFIG.backup_dir)
     dynamics = HeliosDynamics()
-    # FIX: Pass STATE.logger (HeliosLogger instance) instead of STATE.logger.logger
     cot = HeliosCoT(helios_brain, helios_policy, STATE.logger, dynamics)
 
     loop = asyncio.get_event_loop()
